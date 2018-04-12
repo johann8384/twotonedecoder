@@ -27,7 +27,11 @@
 NUM_TONES = 2
 
 # Minimum difference between two tone frequencies in Hz to consider them as different tones
-MIN_TONE_FREQUENCY_DIFFERENCE = 5.0
+MIN_TONE_FREQUENCY_DIFFERENCE = 4.0
+MAX_TONE_FREQUENCY_DIFFERENCE = 15.0
+
+MAX_FREQ = 3000.0
+MIN_FREQ = 300.0
 
 # Minimum length of time in seconds to consider a signal as a tone
 MIN_TONE_LENGTH = 0.200
@@ -38,225 +42,204 @@ MAX_TONE_FREQ_STD_DEVIATION = 10.0
 # Loudness in dB, below which to ignore signals
 SQUELCH = -70.
 
+FIRE_DEPT_TONES = [435.0, 440.0]
+EMS_DEPT_TONES = [467.0, 461.0]
 ################################
 # END Settings
 ################################
 
 import sys
-#sys.stdout = open("logfile.txt","w")
+
+import logging
+from logging.config import fileConfig
+
+fileConfig('logging_config.ini')
+logger = logging.getLogger()
+logger.debug('often makes a very good meal of %s', 'visiting tourists')
 
 try:
-  import numpy
+    import numpy
 except ImportError:
-  print "NumPy required to perform calculations"
-  raise
+    logger.error("NumPy required to perform calculations")
+    raise
 
-from PyQt4.QtCore import *
-from PyQt4.QtGui import *
 
 def schmitt(data, rate):
-  loudness = numpy.sqrt(numpy.sum((data/32768.)**2)) / float(len(data))
-  rms = 20.0 * numpy.log10(loudness)
-  #print "RMS", rms
-  if rms < SQUELCH:
-    return -1
+    loudness = numpy.sqrt(numpy.sum((data / 32768.) ** 2)) / float(len(data))
+    logger.debug("loudness: %s", loudness)
+    if loudness <= 0:
+        return -1
 
-  blockSize = len(data) - 1
+    rms = 20.0 * numpy.log10(loudness)
+    logger.debug("RMS: %s", rms)
+    if rms < SQUELCH:
+        return -1
 
-  #print blockSize
-  freq = 0.
-  trigfact = 0.6
+    blockSize = len(data) - 1
 
-  schmittBuffer = data
+    # print blockSize
+    freq = 0.
+    trigfact = 0.6
+
+    schmittBuffer = data
+
+    A1 = max(schmittBuffer)
+    A2 = min(schmittBuffer)
+
+    # print "A1", A1, "A2", A2
+
+    # calculate trigger values, rounding up
+    t1 = round(A1 * trigfact)
+    t2 = round(A2 * trigfact)
+
+    # print "T1", t1, "T2", t2
+
+    startpoint = -1
+    endpoint = 0
+    schmittTriggered = 0
+    tc = 0
+    schmitt = []
+    for j in range(0, blockSize):
+        schmitt.append(schmittTriggered)
+        if not schmittTriggered:
+            schmittTriggered = (schmittBuffer[j] >= t1)
+        elif schmittBuffer[j] >= t2 and schmittBuffer[j + 1] < t2:
+            schmittTriggered = 0
+            if startpoint == -1:
+                tc = 0
+                startpoint = j
+                endpoint = startpoint + 1
+            else:
+                endpoint = j
+                tc += 1
+
+    # print "Start, end", startpoint, endpoint
+    # print "TC", tc
+    if endpoint > startpoint:
+        freq = rate * (tc / float(endpoint - startpoint))
+
+    """
+    from pylab import *
+    ion()
+    
+    timeArray = arange(0, float(len(data)), 1)
+    timeArray = timeArray / rate
+    timeArray = timeArray * 1000  #scale to milliseconds
   
-  A1 = max(schmittBuffer)
-  A2 = min(schmittBuffer)
-
-  #print "A1", A1, "A2", A2
-
-  # calculate trigger values, rounding up
-  t1 = round(A1 * trigfact)
-  t2 = round(A2 * trigfact)
-
-  #print "T1", t1, "T2", t2
-
-  startpoint = -1
-  endpoint = 0
-  schmittTriggered = 0
-  tc = 0
-  schmitt = []
-  for j in range(0, blockSize):
-    schmitt.append(schmittTriggered)
-    if not schmittTriggered:
-      schmittTriggered = (schmittBuffer[j] >= t1)
-    elif schmittBuffer[j] >= t2 and schmittBuffer[j+1] < t2:
-      schmittTriggered = 0
-      if startpoint == -1:
-        tc = 0
-        startpoint = j
-        endpoint = startpoint+1
-      else:
-        endpoint = j
-        tc += 1
-
-  #print "Start, end", startpoint, endpoint
-  #print "TC", tc
-  if endpoint > startpoint:
-    freq = rate * (tc / float(endpoint - startpoint))
-    
-  """
-  from pylab import *
-  ion()
+    hold(False)
   
-  timeArray = arange(0, float(len(data)), 1)
-  timeArray = timeArray / rate
-  timeArray = timeArray * 1000  #scale to milliseconds
+    plot(timeArray, data, 'k', timeArray[startpoint:endpoint], [s*1000 for s in schmitt[startpoint:endpoint]], 'r')
+    title('Frequency: %7.3f Hz' % freq)
+    ylabel('Amplitude')
+    xlabel('Time (ms)')
+  
+    draw()
+    """
 
-  hold(False)
-
-  plot(timeArray, data, 'k', timeArray[startpoint:endpoint], [s*1000 for s in schmitt[startpoint:endpoint]], 'r')
-  title('Frequency: %7.3f Hz' % freq)
-  ylabel('Amplitude')
-  xlabel('Time (ms)')
-
-  draw()
-  """
-
-  return freq
+    return freq
 
 
-class MeasurerThread(QThread):
-  def __init__(self, parent = None):
-    QThread.__init__(self, parent)
-    self.running = True
+class DetectTones():
 
-  def __del__(self):
-    self.running = False
-    self.wait()
-    
-  def run(self):
-    chunk = 2048
-    
-    if len(sys.argv) > 1:
-      wavfile = sys.argv[1]
-    else:
-      wavfile = ''
+    def validate_freq(self, freq):
+        return (freq >= MIN_FREQ and freq <= MAX_FREQ)
 
-    if not wavfile:
-      try:
-        import pyaudio
-      except ImportError:
-        print "PyAudio required to capture audio"
-        raise
-      
-      pa = pyaudio.PyAudio()
+    def detect_tones(self, freq1, freq2):
+        span = abs(freq2 - freq1)
 
-      print "Device Info", pa.get_default_host_api_info()
+        logger.info("span: %s", span)
 
-      #input_device_index = pa.get_host_api_info_by_type(pyaudio.paOSS)['defaultInputDevice']
-      input_device_index = pa.get_default_host_api_info()['defaultInputDevice']
+        if self.validate_freq(freq1) and self.validate_freq(freq2):
 
-      FORMAT = pyaudio.paInt16
-      channels = 1
-      rate = 44100
-      
-      stream = pa.open(format = FORMAT,
-                      channels = channels,
-                      rate = rate,
-                      input = True,
-                      input_device_index = input_device_index,
-                      frames_per_buffer = chunk)
+            if span >= MIN_TONE_FREQUENCY_DIFFERENCE and span <= MAX_TONE_FREQUENCY_DIFFERENCE:
+                logger.info("Tones Changed: %s, %s", freq1, freq2)
+                if [freq1, freq2] == FIRE_DEPT_TONES:
+                    logger.critical("fire dept dispatch!")
+                    return 2
+                elif [freq1, freq2] == EMS_DEPT_TONES:
+                    logger.critical("ems dept dispatch!")
+                    return 2
+                else:
+                    logger.warn("possible unidentified dispatch [%s, %s]", freq1, freq2)
+                    return 1
+            else:
+                logger.debug("not enough change")
+        else:
+            logger.debug("frequency out of range")
 
-    else:
-      import wave
-      wav = wave.open(wavfile, 'r')
-      rate = wav.getframerate()
-      channels = wav.getnchannels()
-      print "channels", wav.getnchannels()
-      print "width", wav.getsampwidth()
-      print "Wav rate", rate
-    
-    #for i in range(0, ATE / chunk * RECORD_SECONDS):
-    freqBufferSize = int(MIN_TONE_LENGTH * rate / float(chunk))
-    freqBuffer = numpy.zeros(freqBufferSize)
-    freqIndex = 0
-    lastFreq = 0.
-    toneIndex = -1
-    while self.running:
-      if not wavfile:
-        data = stream.read(chunk)
-      else:
-        data = wav.readframes(chunk)
-        if wav.tell() >= wav.getnframes():
-          break
-      buf = numpy.fromstring(data, dtype=numpy.int16)
-      if channels == 2:
-        # Get rid of second channel
-        buf = buf.reshape(-1, 2)
-        buf = numpy.delete(buf, 1, axis=1)
-        buf = buf.reshape(-1)
+        return 0
 
-      #print "A", len(a)
-      freq = schmitt(buf, rate)
-      if freq > 0:
-        print "Freq", freq
-        freqBuffer[freqIndex % freqBufferSize] = freq
-        freqIndex += 1
-        print freqBuffer
-        stddev = freqBuffer.std()
-        print "Std deviation", stddev
-        if stddev < MAX_TONE_FREQ_STD_DEVIATION:
-          mean = freqBuffer.mean()
-          # Clear ringbuffer
-          #freqBuffer = numpy.zeros(freqBufferSize)
-          print "Mean", mean, "Last", lastFreq
-          if abs(mean - lastFreq) > MIN_TONE_FREQUENCY_DIFFERENCE:
-            toneIndex = (toneIndex + 1) % NUM_TONES
-            if toneIndex == 0:
-              self.emit(SIGNAL("clearFrequencies()"))
+    def detectWaveFile(self, wavfile):
+        chunk = 2048
+        import wave
+        wav = wave.open(wavfile, 'r')
+
+        rate = wav.getframerate()
+        channels = wav.getnchannels()
+        width = wav.getsampwidth()
+
+        logger.info("channels: %d", channels)
+        logger.info("width: %d", width)
+        logger.info("rate: %d", rate)
+
+        tones = [0, 0]
+        mean = 0
+
+        freqBufferSize = int(MIN_TONE_LENGTH * rate / float(chunk))
+        freqBuffer = numpy.zeros(freqBufferSize)
+        freqIndex = 0
+        lastFreq = 0.
+        toneIndex = -1
+
+        while wav.tell() < wav.getnframes():
+
+            data = wav.readframes(chunk)
+
+            buf = numpy.fromstring(data, dtype=numpy.int16)
+
+            if channels == 2:
+                # Get rid of second channel
+                buf = buf.reshape(-1, 2)
+                buf = numpy.delete(buf, 1, axis=1)
+                buf = buf.reshape(-1)
+
+            freq = schmitt(buf, rate)
+            if freq > 0:
+                freqBuffer[freqIndex % freqBufferSize] = freq
+                stddev = freqBuffer.std()
+                logger.info("Std deviation: %s", stddev)
+
+                if stddev < MAX_TONE_FREQ_STD_DEVIATION:
+                    mean = freqBuffer.mean()
+                    # Clear ringbuffer
+                    # freqBuffer = numpy.zeros(freqBufferSize)
+                    logger.info("Mean: %s, Last: %s", mean, lastFreq)
+
+                    if abs(mean - lastFreq) > MIN_TONE_FREQUENCY_DIFFERENCE:
+                        toneIndex = (toneIndex + 1) % NUM_TONES
+                        logger.debug("tone index: %s", toneIndex)
+                        if toneIndex == 0:
+                            logger.debug("clear freq")
+                        else:
+                            logger.info("update freq: %s, %s", lastFreq, mean)
+                            code = self.detect_tones(numpy.trunc(lastFreq), numpy.trunc(mean))
+                            if (code > 0):
+                                wav.close()
+                                return code
+
+            # lastRoundFreq = roundFreq
             lastFreq = mean
-            self.emit(SIGNAL("measureFrequency(float, int)"), mean, toneIndex)
 
-    if not wavfile:
-      stream.close()
-      pa.terminate()
-    else:
-      wav.close()
+        wav.close()
+        return 0
 
-class MainWindow(QWidget):
-  def __init__(self, parent = None):
-    QWidget.__init__(self, parent)
-    
-    self.thread = MeasurerThread()
-    self.connect(self.thread, SIGNAL("measureFrequency(float, int)"), self.showFrequency)
-    self.connect(self.thread, SIGNAL("clearFrequencies()"), self.clearFrequencies)
-    self.thread.start()
-
-    self.frequencyLCDs = []
-    for i in range(NUM_TONES):
-      self.frequencyLCDs.append(QLCDNumber())
-
-    vbox = QVBoxLayout()
-    for lcd in self.frequencyLCDs:
-      lcd.setSegmentStyle(QLCDNumber.Flat)
-      vbox.addWidget(lcd)
-
-    self.clearFrequencies()
-
-    self.setLayout(vbox)
-
-    self.setWindowTitle(self.tr("Two-tone Decoder"))
-    self.resize(200, 100)
-
-  def showFrequency(self, freq, i):
-    self.frequencyLCDs[i].display(freq)
-
-  def clearFrequencies(self):
-    for lcd in self.frequencyLCDs:
-      lcd.display('')
 
 if __name__ == "__main__":
-  app = QApplication(sys.argv)
-  window = MainWindow()
-  window.show()
-  sys.exit(app.exec_())
+    if len(sys.argv) > 1:
+        wavfile = sys.argv[1]
+    else:
+        logger.error("no wave file provided")
+        sys.exit(1)
+
+    toneDetector = DetectTones()
+    sys.exit(toneDetector.detectWaveFile(wavfile))
